@@ -103,5 +103,25 @@ curl -sS "$BASE/batches/CRASH-4" | j
 
 echo; echo "== 6. data lake endpoint hides quarantined batches =="
 curl -sS "$BASE/data/released?device_id=$DEV" | j | grep -E 'total_released|batch_no'
+
+echo; echo "== 7. suspend/resume: withholding closure across the reference graph =="
+SDEV="${DEV}-SUSP"
+# Six released batches; from the 4th each window references the previous three.
+for i in 1 2 3 4 5 6; do
+  csv "S$i" 500 5 > "/tmp/s_demo_$i.csv"
+  post "SUSP-$i" "$SDEV" "/tmp/s_demo_$i.csv" >/dev/null
+  wait_decided "SUSP-$i" >/dev/null
+done
+echo "  before suspend, served count: $(curl -sS "$BASE/data/released?device_id=$SDEV" | python3 -c 'import sys,json;print(json.load(sys.stdin)["total_released"])')"
+echo "  suspend SUSP-2 (reason recorded):"
+curl -sS -X POST "$BASE/batches/SUSP-2/suspend" -H 'Content-Type: application/json' \
+  -d '{"reason":"raw thickness file under review"}' | j
+echo "  served while suspended (expect SUSP-1,SUSP-3 only):"
+curl -sS "$BASE/data/released?device_id=$SDEV" | j | grep -E 'total_released|batch_no'
+echo "  withholding sources on SUSP-6:"
+curl -sS "$BASE/batches/SUSP-6" | j | grep -A6 'withholding_sources'
+echo "  resume SUSP-2, then all six are served again:"
+curl -sS -X POST "$BASE/batches/SUSP-2/resume" | j | grep -E 'changed|still_withheld'
+curl -sS "$BASE/data/released?device_id=$SDEV" | j | grep total_released
 echo
 echo "OpenAPI docs: $BASE/docs"

@@ -11,6 +11,7 @@ from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from .config import settings
 from .csvutil import CsvValidationError, parse_thickness_csv
@@ -23,6 +24,12 @@ from .service import (
     list_device_batches,
 )
 from .storage import persist_original
+from .suspension import (
+    SuspensionError,
+    list_suspensions,
+    resume_batch,
+    suspend_batch,
+)
 from .worker import DecisionWorker
 
 logging.basicConfig(
@@ -31,6 +38,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("fab.api")
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+
+
+class SuspendRequest(BaseModel):
+    reason: str = Field(
+        ..., min_length=1,
+        description="暂停原因（必填），随暂停状态与审计流水持久化",
+    )
 
 
 @asynccontextmanager
@@ -48,12 +62,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="晶圆厚度批次放行 API / Wafer Thickness Batch Release API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "厚度明细入湖前的漂移批次隔离服务。\n\n"
         "同设备按持久化受理顺序判定：前 3 批放行；其后批中位数与最近 3 个"
         "已放行批中位数均值相差超过 5nm 则隔离，隔离批不进入参考窗口。"
-        "双实例后台处理，同设备严格 FIFO、不阻塞其他设备。"
+        "双实例后台处理，同设备严格 FIFO、不阻塞其他设备。\n\n"
+        "供数暂停：仅已放行批可暂停（记录原因）；暂停批及直接或间接以它为"
+        "判定参考的放行批均从 /data/released 暂扣，后来判定的依赖批自动暂扣；"
+        "解除后仍受其他暂停批影响的数据继续暂扣。暂停不改变原判定、参考窗口"
+        "与后台处理。"
     ),
     lifespan=lifespan,
 )
@@ -70,6 +88,12 @@ async def _conflict_handler(_request, exc: ConflictError):
         status_code=409,
         content={"error": str(exc), "existing": exc.existing},
     )
+
+
+@app.exception_handler(SuspensionError)
+async def _suspension_error_handler(_request, exc: SuspensionError):
+    return JSONResponse(status_code=exc.status_code,
+                        content={"error": exc.message})
 
 
 @app.get("/health")
@@ -123,7 +147,7 @@ async def submit_batch(
     }
 
 
-@app.get("/batches/{batch_no}", summary="查询判定结果及参考批号")
+@app.get("/batches/{batch_no}", summary="查询判定结果、参考批号及暂扣来源")
 async def query_batch(batch_no: str):
     detail = await get_batch_detail(get_pool_safe(), batch_no)
     if detail is None:
@@ -137,7 +161,36 @@ async def device_batches(device_id: str):
     return {"device_id": device_id, "count": len(rows), "batches": rows}
 
 
-@app.get("/data/released", summary="数据湖供数接口（仅放行明细，隔离批不可见）")
+@app.post("/batches/{batch_no}/suspend",
+          status_code=status.HTTP_200_OK,
+          summary="按批号暂停供数（仅已放行批，需填写原因）")
+async def suspend_released_batch(batch_no: str, body: SuspendRequest):
+    """暂停一批已放行数据的供数。
+
+    该批及直接/间接以它为判定参考的放行批立即从 ``/data/released`` 暂扣；
+    之后才判定、引用了该批的放行批也会自动暂扣。重复暂停幂等返回，不改变
+    既有原因与状态，但会追加审计事件。
+    """
+    return await suspend_batch(get_pool_safe(), batch_no=batch_no.strip(),
+                               reason=body.reason)
+
+
+@app.post("/batches/{batch_no}/resume",
+          status_code=status.HTTP_200_OK,
+          summary="解除一批的暂停（仍受其他暂停批影响时继续暂扣）")
+async def resume_released_batch(batch_no: str):
+    """解除单批暂停。若该批仍可从其他暂停批沿参考图到达，则继续暂扣。"""
+    return await resume_batch(get_pool_safe(), batch_no=batch_no.strip())
+
+
+@app.get("/suspensions", summary="列出当前所有暂停记录及其暂扣子树")
+async def get_suspensions():
+    rows = await list_suspensions(get_pool_safe())
+    return {"count": len(rows), "suspensions": rows}
+
+
+@app.get("/data/released",
+         summary="数据湖供数接口（仅合格放行明细；隔离批与暂扣批不可见）")
 async def released_data(
     device_id: Optional[str] = Query(None),
     batch_no: Optional[str] = Query(None),

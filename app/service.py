@@ -9,6 +9,7 @@ import asyncpg
 
 from .csvutil import ParsedCsv
 from .storage import StoredArtifact
+from .suspension import get_withholding_info, released_base_where
 
 # Unique constraint backing per-device accept_seq (see schema.py).  Concurrent
 # inserts of the same next sequence collide here and are retried, which keeps
@@ -164,7 +165,7 @@ async def get_batch_detail(pool: asyncpg.pool.Pool,
                 ref_ids, ref_ids,
             )
             ref_batch_nos = [r["batch_no"] for r in ref_rows]
-        return {
+        detail = {
             "batch_no": row["batch_no"],
             "device_id": row["device_id"],
             "status": row["status"],
@@ -184,6 +185,14 @@ async def get_batch_detail(pool: asyncpg.pool.Pool,
             "created_at": row["created_at"].isoformat() if row["created_at"] else None,
             "decided_at": row["decided_at"].isoformat() if row["decided_at"] else None,
         }
+    # Suspension/withholding state (released batches only can ever be withheld;
+    # pending and quarantined batches never enter the data lake anyway).
+    if row["status"] == "RELEASED":
+        detail.update(await get_withholding_info(pool, row["id"]))
+    else:
+        detail.update({"withheld": False, "suspension": None,
+                       "withholding_sources": [], "suspension_events": []})
+    return detail
 
 
 async def list_device_batches(pool: asyncpg.pool.Pool,
@@ -214,42 +223,49 @@ async def get_released_data(pool: asyncpg.pool.Pool, *,
                             batch_no: Optional[str],
                             limit: int,
                             offset: int) -> Tuple[int, List[Dict[str, Any]]]:
-    """Read model for the data lake: *only* released batches are served."""
-    where = ["status = 'RELEASED'"]
-    params: List[Any] = []
-    if device_id:
-        params.append(device_id)
-        where.append(f"device_id = ${len(params)}")
-    if batch_no:
-        params.append(batch_no)
-        where.append(f"batch_no = ${len(params)}")
-    where_sql = " WHERE " + " AND ".join(where)
+    """Read model for the data lake: only *eligible* released batches show up.
+
+    A released batch is eligible when it is neither suspended itself nor
+    reachable (directly or transitively through ``reference_ids``) from a
+    suspended batch.  The count and the page of details are read inside one
+    REPEATABLE READ transaction, so both always correspond to the same
+    committed state even if a suspend/resume lands between the two statements.
+    """
+    from .suspension import _WITHHELD_CTE
+
+    where_sql, params = released_base_where(device_id, batch_no)
 
     async with pool.acquire() as conn:
-        total = await conn.fetchval(
-            f"SELECT count(*) FROM batches{where_sql}", *params)
-        params.append(limit)
-        params.append(offset)
-        rows = await conn.fetch(
-            f"SELECT id, batch_no, device_id, accept_seq, median_nm, decided_at "
-            f"FROM batches{where_sql} ORDER BY id "
-            f"LIMIT ${len(params) - 1} OFFSET ${len(params)}",
-            *params,
-        )
-        out: List[Dict[str, Any]] = []
-        for r in rows:
-            wafers = await conn.fetch(
-                "SELECT wafer_no, thickness_nm FROM wafer_measurements "
-                "WHERE batch_id=$1 ORDER BY wafer_no", r["id"])
-            out.append({
-                "batch_no": r["batch_no"],
-                "device_id": r["device_id"],
-                "accept_seq": r["accept_seq"],
-                "median_nm": r["median_nm"],
-                "decided_at": r["decided_at"].isoformat() if r["decided_at"] else None,
-                "wafers": [
-                    {"wafer_no": w["wafer_no"], "thickness_nm": w["thickness_nm"]}
-                    for w in wafers
-                ],
-            })
-        return total, out
+        async with conn.transaction(isolation="repeatable_read",
+                                    readonly=True):
+            total = await conn.fetchval(
+                _WITHHELD_CTE
+                + "SELECT count(*) FROM batches b" + where_sql,
+                *params,
+            )
+            page_params = params + [limit, offset]
+            rows = await conn.fetch(
+                _WITHHELD_CTE
+                + "SELECT b.id, b.batch_no, b.device_id, b.accept_seq, "
+                "b.median_nm, b.decided_at FROM batches b" + where_sql
+                + f" ORDER BY b.id LIMIT ${len(params) + 1}"
+                f" OFFSET ${len(params) + 2}",
+                *page_params,
+            )
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                wafers = await conn.fetch(
+                    "SELECT wafer_no, thickness_nm FROM wafer_measurements "
+                    "WHERE batch_id=$1 ORDER BY wafer_no", r["id"])
+                out.append({
+                    "batch_no": r["batch_no"],
+                    "device_id": r["device_id"],
+                    "accept_seq": r["accept_seq"],
+                    "median_nm": r["median_nm"],
+                    "decided_at": r["decided_at"].isoformat() if r["decided_at"] else None,
+                    "wafers": [
+                        {"wafer_no": w["wafer_no"], "thickness_nm": w["thickness_nm"]}
+                        for w in wafers
+                    ],
+                })
+            return total, out

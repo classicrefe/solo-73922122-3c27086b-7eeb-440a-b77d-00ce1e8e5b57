@@ -13,6 +13,18 @@ Durability model
 * Row-level locking (``SELECT ... FOR UPDATE`` on ``device_state`` plus a
   transaction-scoped advisory lock on the device) serialises workers for one
   device while different devices proceed independently.
+
+Suspension model
+----------------
+* ``batch_suspensions`` holds one row per currently-suspended released batch
+  (primary key on batch id); ``batch_suspension_events`` is the append-only
+  audit trail that survives a later resume.
+* Suspension never alters a decision, the reference window or background
+  processing.  The set of withheld batches -- the suspended batches plus
+  every released batch that directly or transitively used one as a decision
+  reference -- is computed on read with a recursive CTE over
+  ``batches.reference_ids``, so batches decided later are withheld
+  automatically without any write.
 """
 
 SCHEMA_SQL = """
@@ -50,16 +62,49 @@ CREATE INDEX IF NOT EXISTS idx_batches_device_seq
 CREATE INDEX IF NOT EXISTS idx_batches_status
     ON batches (status) WHERE status = 'PENDING';
 CREATE INDEX IF NOT EXISTS idx_wafers_batch ON wafer_measurements (batch_id);
+-- Supports the recursive dependency walk used by withholding: find every
+-- batch whose reference window contains a given batch id.
+CREATE INDEX IF NOT EXISTS idx_batches_reference_ids
+    ON batches USING GIN (reference_ids);
 
 -- One row per device: the durable processing cursor (last accepted sequence
--- that has been decided) and the FIFO list of released batch ids that form
--- the rolling reference window (most recent last).
+-- that has been decided) and the FIFO list of released batch ids that form the
+-- rolling reference window (most recent last).
 CREATE TABLE IF NOT EXISTS device_state (
     device_id        TEXT PRIMARY KEY,
     last_decided_seq BIGINT NOT NULL DEFAULT 0,
     ref_batch_ids    JSONB  NOT NULL DEFAULT '[]'::jsonb,
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Data-supply suspension state.  A row exists exactly while a released batch
+-- is suspended; the primary key makes repeated suspends idempotent under
+-- concurrent requests from the two API instances.  Suspension never changes
+-- the batch decision itself -- status stays RELEASED, only visibility in
+-- /data/released is withheld (for this row and every batch that directly or
+-- transitively references it, computed on read via recursive CTE).
+CREATE TABLE IF NOT EXISTS batch_suspensions (
+    batch_id    BIGINT PRIMARY KEY
+                REFERENCES batches(id) ON DELETE RESTRICT,
+    reason      TEXT        NOT NULL CHECK (length(btrim(reason)) > 0),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by  TEXT        NOT NULL
+);
+
+-- Append-only audit trail of every suspend/resume operation, including
+-- duplicate/idempotent calls, so the history survives a later resume.
+CREATE TABLE IF NOT EXISTS batch_suspension_events (
+    id          BIGGENERATED_PLACEHOLDER,
+    batch_id    BIGINT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    action      TEXT   NOT NULL CHECK (action IN ('SUSPEND','RESUME')),
+    reason      TEXT,
+    actor       TEXT   NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT batch_suspension_events_pkey PRIMARY KEY (id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_suspension_events_batch
+    ON batch_suspension_events (batch_id, id);
 """
 
 
